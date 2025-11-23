@@ -3,7 +3,7 @@ import requests
 import hashlib
 import logging
 from datetime import datetime
-
+import os
 app = Flask(__name__)
 # It's crucial to change this secret key in a production environment
 app.secret_key = 'a_very_secret_and_random_string'
