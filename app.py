@@ -1,1851 +1,1015 @@
-from fyers_apiv3 import fyersModel
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
-import webbrowser
-import pandas as pd
-import os
-import threading
-import time
-import json
+from flask import Flask, render_template_string, request, session, flash, redirect, url_for, get_flashed_messages, jsonify
 import requests
 import hashlib
+import logging
 from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = "sajid_secret_key_change_this"
-
-# ===== m.Stock API Credentials =====
-# Fixed API secret for all users
-MSTOCK_API_SECRET = '<your_api_secret_here>'
-
-# Text files for storing data
-USERS_FILE = "users.txt"
-CREDENTIALS_FILE = "user_credentials.txt"
-
-# Initialize files
-def init_files():
-    if not os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'w') as f:
-            f.write("")
-    if not os.path.exists(CREDENTIALS_FILE):
-        with open(CREDENTIALS_FILE, 'w') as f:
-            f.write("")
-
-init_files()
-
-# ---- User Management Functions ----
-def save_user(username, password, email):
-    with open(USERS_FILE, 'a') as f:
-        hashed_pw = generate_password_hash(password)
-        f.write(f"{username}|{hashed_pw}|{email}\n")
-
-def get_user(username):
-    if not os.path.exists(USERS_FILE):
-        return None
-    with open(USERS_FILE, 'r') as f:
-        for line in f:
-            if line.strip():
-                parts = line.strip().split('|')
-                if len(parts) >= 3 and parts[0] == username:
-                    return {'username': parts[0], 'password': parts[1], 'email': parts[2]}
-    return None
-
-def verify_user(username, password):
-    user = get_user(username)
-    if user and check_password_hash(user['password'], password):
-        return user
-    return None
-
-def save_user_credentials(username, client_id=None, secret_key=None, auth_code=None, mstock_api_key=None):
-    credentials = {}
-    if os.path.exists(CREDENTIALS_FILE):
-        with open(CREDENTIALS_FILE, 'r') as f:
-            for line in f:
-                if line.strip():
-                    parts = line.strip().split('|')
-                    if len(parts) >= 5:
-                        credentials[parts[0]] = {
-                            'client_id': parts[1], 
-                            'secret_key': parts[2], 
-                            'auth_code': parts[3],
-                            'mstock_api_key': parts[4]
-                        }
-
-    if username not in credentials:
-        credentials[username] = {
-            'client_id': '', 
-            'secret_key': '', 
-            'auth_code': '',
-            'mstock_api_key': ''
-        }
-
-    if client_id:
-        credentials[username]['client_id'] = client_id
-    if secret_key:
-        credentials[username]['secret_key'] = secret_key
-    if auth_code:
-        credentials[username]['auth_code'] = auth_code
-    if mstock_api_key:
-        credentials[username]['mstock_api_key'] = mstock_api_key
-
-    with open(CREDENTIALS_FILE, 'w') as f:
-        for user, creds in credentials.items():
-            f.write(f"{user}|{creds['client_id']}|{creds['secret_key']}|{creds['auth_code']}|{creds['mstock_api_key']}\n")
-
-def get_user_credentials(username):
-    if not os.path.exists(CREDENTIALS_FILE):
-        return None
-    with open(CREDENTIALS_FILE, 'r') as f:
-        for line in f:
-            if line.strip():
-                parts = line.strip().split('|')
-                if len(parts) >= 5 and parts[0] == username:
-                    return {
-                        'client_id': parts[1], 
-                        'secret_key': parts[2], 
-                        'auth_code': parts[3],
-                        'mstock_api_key': parts[4]
-                    }
-    return None
-
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'username' not in session:
-            return redirect(url_for('login_page'))
-        return f(*args, **kwargs)
-    return decorated_function
-
-# ---- User-specific sessions ----
-user_sessions = {}
-
-def get_user_session(username):
-    if username not in user_sessions:
-        user_sessions[username] = {
-            'fyers': None,
-            'atm_strike': None,
-            'initial_data': None,
-            'atm_ce_plus20': 20,
-            'atm_pe_plus20': 20,
-            'symbol_prefix': 'NSE:NIFTY25',
-            'selected_index': 'NSE:NIFTY50-INDEX',
-            'signals': [],
-            'placed_orders': set(),
-            'open_orders': [],
-            'bot_running': False,
-            'bot_thread': None,
-            'redirect_uri': f'http://127.0.0.1:5000/callback/{username}',
-            'quantity': 75,
-            'ce_offset': -300,
-            'pe_offset': 300,
-            'mstock_access_token': None,
-            'mstock_access_token_expiry': None,
-            'mstock_refresh_token': None,
-            'mstock_refresh_token_expiry': None
-        }
-    return user_sessions[username]
-
-# ===== mStock Authentication Routes =====
-@app.route("/mstock/login", methods=["GET", "POST"])
-@login_required
-def login_mstock():
-    """OTP-based m.Stock authentication"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    creds = get_user_credentials(username)
-    
-    if not creds or not creds['mstock_api_key']:
-        return jsonify({
-            "status": "error",
-            "message": "mStock API key not configured. Please setup your mStock credentials first."
-        }), 400
-    
-    if request.method == "GET":
-        access_token = user_sess.get('mstock_access_token')
-        if access_token and user_sess.get('mstock_access_token_expiry', 0) > time.time():
-            return jsonify({
-                "status": "authenticated",
-                "access_token": access_token,
-                "access_token_expiry": user_sess.get('mstock_access_token_expiry'),
-                "refresh_token": user_sess.get('mstock_refresh_token'),
-                "refresh_token_expiry": user_sess.get('mstock_refresh_token_expiry')
-            })
-        else:
-            return jsonify({
-                "status": "not_authenticated",
-                "message": "Please provide OTP to authenticate"
-            })
-    
-    # POST request - authenticate with OTP
-    totp = request.form.get("totp", "").strip() or request.json.get("totp", "").strip()
-    if not totp:
-        return jsonify({
-            "status": "error",
-            "message": "OTP is required"
-        }), 400
-    
-    checksum = hashlib.sha256(f"{creds['mstock_api_key']}{totp}{MSTOCK_API_SECRET}".encode()).hexdigest()
-    headers = {'X-Mirae-Version': '1', 'Content-Type': 'application/x-www-form-urlencoded'}
-    data = {'api_key': creds['mstock_api_key'], 'totp': totp, 'checksum': checksum}
-    
-    try:
-        response = requests.post(
-            'https://api.mstock.trade/openapi/typea/session/verifytotp',
-            headers=headers,
-            data=data
-        )
-        resp_json = response.json()
-        
-        if resp_json.get("status") == "success":
-            access_token = resp_json["data"]["access_token"]
-            access_token_expiry = time.time() + resp_json["data"].get("expires_in", 3600)
-            user_sess['mstock_access_token'] = access_token
-            user_sess['mstock_access_token_expiry'] = access_token_expiry
-            
-            if "refresh_token" in resp_json["data"]:
-                refresh_token = resp_json["data"]["refresh_token"]
-                refresh_token_expiry = time.time() + resp_json["data"].get("refresh_token_expires_in", 86400)
-                user_sess['mstock_refresh_token'] = refresh_token
-                user_sess['mstock_refresh_token_expiry'] = refresh_token_expiry
-                
-                return jsonify({
-                    "status": "success",
-                    "message": "mStock Authentication successful",
-                    "access_token": access_token,
-                    "access_token_expiry": access_token_expiry,
-                    "refresh_token": refresh_token,
-                    "refresh_token_expiry": refresh_token_expiry
-                })
-            else:
-                return jsonify({
-                    "status": "success",
-                    "message": "mStock Authentication successful",
-                    "access_token": access_token,
-                    "access_token_expiry": access_token_expiry
-                })
-        else:
-            return jsonify({
-                "status": "error",
-                "message": resp_json.get("message", "Failed to generate session")
-            }), 400
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Error verifying OTP: {str(e)}"
-        }), 500
-
-@app.route("/mstock/refresh_token", methods=["POST"])
-@login_required
-def refresh_mstock_token():
-    """Refresh mStock access token using refresh token"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    refresh_token = user_sess.get('mstock_refresh_token')
-    
-    if not refresh_token:
-        return jsonify({
-            "status": "error",
-            "message": "No refresh token available. Please authenticate first."
-        }), 400
-    
-    try:
-        headers = {
-            'X-Mirae-Version': '1',
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
-        data = {
-            'api_key': get_user_credentials(username)['mstock_api_key'],
-            'refresh_token': refresh_token
-        }
-        
-        response = requests.post(
-            'https://api.mstock.trade/openapi/typea/session/refresh',
-            headers=headers,
-            data=data
-        )
-        
-        resp_json = response.json()
-        if resp_json.get("status") == "success":
-            access_token = resp_json["data"]["access_token"]
-            access_token_expiry = time.time() + resp_json["data"].get("expires_in", 3600)
-            user_sess['mstock_access_token'] = access_token
-            user_sess['mstock_access_token_expiry'] = access_token_expiry
-            
-            if "refresh_token" in resp_json["data"]:
-                new_refresh_token = resp_json["data"]["refresh_token"]
-                refresh_token_expiry = time.time() + resp_json["data"].get("refresh_token_expires_in", 86400)
-                user_sess['mstock_refresh_token'] = new_refresh_token
-                user_sess['mstock_refresh_token_expiry'] = refresh_token_expiry
-                
-                return jsonify({
-                    "status": "success",
-                    "message": "Token refreshed successfully",
-                    "access_token": access_token,
-                    "access_token_expiry": access_token_expiry,
-                    "refresh_token": new_refresh_token,
-                    "refresh_token_expiry": refresh_token_expiry
-                })
-            else:
-                return jsonify({
-                    "status": "success",
-                    "message": "Token refreshed successfully",
-                    "access_token": access_token,
-                    "access_token_expiry": access_token_expiry
-                })
-        else:
-            return jsonify({
-                "status": "error",
-                "message": resp_json.get("message", "Failed to refresh token")
-            }), 400
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Error refreshing token: {str(e)}"
-        }), 500
-
-@app.route("/mstock/logout", methods=["POST"])
-@login_required
-def logout_mstock():
-    """Logout from mStock and clear session"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    user_sess['mstock_access_token'] = None
-    user_sess['mstock_access_token_expiry'] = None
-    user_sess['mstock_refresh_token'] = None
-    user_sess['mstock_refresh_token_expiry'] = None
-    
-    return jsonify({
-        "status": "success",
-        "message": "Logged out from mStock successfully"
-    })
-
-@app.route("/mstock/status", methods=["GET"])
-@login_required
-def mstock_status():
-    """Check mStock authentication status"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    access_token = user_sess.get('mstock_access_token')
-    
-    if access_token and user_sess.get('mstock_access_token_expiry', 0) > time.time():
-        return jsonify({
-            "status": "authenticated",
-            "access_token": access_token,
-            "access_token_expiry": user_sess.get('mstock_access_token_expiry'),
-            "refresh_token": user_sess.get('mstock_refresh_token'),
-            "refresh_token_expiry": user_sess.get('mstock_refresh_token_expiry')
-        })
-    else:
-        return jsonify({
-            "status": "not_authenticated",
-            "message": "No active mStock session"
-        })
-
-# New route for mStock authentication UI
-@app.route("/mstock_auth", methods=["GET", "POST"])
-@login_required
-def mstock_auth_page():
-    """m.Stock authentication UI page"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    creds = get_user_credentials(username)
-    access_token = user_sess.get('mstock_access_token')
-    error = None
-
-    if request.method == "POST" and not access_token:
-        totp = request.form.get("totp", "").strip()
-        if not totp:
-            error = "OTP is required!"
-        else:
-            if not creds or not creds['mstock_api_key']:
-                error = "mStock API key not configured. Please setup your mStock credentials first."
-            else:
-                checksum = hashlib.sha256(f"{creds['mstock_api_key']}{totp}{MSTOCK_API_SECRET}".encode()).hexdigest()
-                headers = {'X-Mirae-Version': '1', 'Content-Type': 'application/x-www-form-urlencoded'}
-                data = {'api_key': creds['mstock_api_key'], 'totp': totp, 'checksum': checksum}
-                try:
-                    response = requests.post(
-                        'https://api.mstock.trade/openapi/typea/session/verifytotp',
-                        headers=headers,
-                        data=data
-                    )
-                    resp_json = response.json()
-                    if resp_json.get("status") == "success":
-                        access_token = resp_json["data"]["access_token"]
-                        access_token_expiry = time.time() + resp_json["data"].get("expires_in", 3600)
-                        user_sess['mstock_access_token'] = access_token
-                        user_sess['mstock_access_token_expiry'] = access_token_expiry
-                        
-                        if "refresh_token" in resp_json["data"]:
-                            refresh_token = resp_json["data"]["refresh_token"]
-                            refresh_token_expiry = time.time() + resp_json["data"].get("refresh_token_expires_in", 86400)
-                            user_sess['mstock_refresh_token'] = refresh_token
-                            user_sess['mstock_refresh_token_expiry'] = refresh_token_expiry
-                    else:
-                        error = resp_json.get("message", "Failed to generate session")
-                except Exception as e:
-                    error = f"Error verifying OTP: {str(e)}"
-
-    return render_template_string(MSTOCK_AUTH_TEMPLATE, access_token=access_token, error=error, mstock_api_key=creds['mstock_api_key'] if creds else "")
-
-# New route for mStock option chain page
-@app.route("/mstock_option_chain")
-@login_required
-def mstock_option_chain_page():
-    """Display mStock option chain page (only after login)"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    access_token = user_sess.get('mstock_access_token')
-    if not access_token:
-        return "<h3>⚠ Please authenticate with mStock first. <a href='/mstock_auth'>Go to mStock Authentication</a></h3>"
-    return render_template_string(MSTOCK_OPTION_CHAIN_TEMPLATE)
-
-# New route for fetching mStock option chain data
-@app.route("/fetch_mstock_option_chain")
-@login_required
-def fetch_mstock_option_chain():
-    """Fetch live option chain data from m.Stock API"""
-    username = session['username']
-    user_sess = get_user_session(username)
-    creds = get_user_credentials(username)
-    access_token = user_sess.get('mstock_access_token')
-    
-    if not access_token:
-        return jsonify({"error": "Please authenticate with mStock first!"})
-
-    try:
-        # Example endpoint (replace with real m.Stock option chain endpoint)
-        url = "https://api.mstock.trade/api/optionchain"
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-            "X-Mirae-Version": "1"
-        }
-        payload = {"symbol": "NSE:NIFTY50-INDEX", "strikecount": 20}
-        resp = requests.post(url, headers=headers, json=payload)
-        data = resp.json()
-
-        if "data" not in data or "optionsChain" not in data["data"]:
-            return jsonify({"error": f"Invalid response: {data}"})
-
-        df = pd.DataFrame(data["data"]["optionsChain"])
-        df_pivot = df.pivot_table(
-            index="strike_price",
-            columns="option_type",
-            values=["ltp", "oi", "ltpch", "oich"],  # Include OI, change and OI change
-            aggfunc="first"
-        ).reset_index()
-        df_pivot = df_pivot.rename(columns={
-            "ltp_CE": "CE_LTP", 
-            "ltp_PE": "PE_LTP", 
-            "oi_CE": "CE_OI", 
-            "oi_PE": "PE_OI", 
-            "ltpch_CE": "CE_Chng", 
-            "ltpch_PE": "PE_Chng",
-            "oich_CE": "CE_OI_Chng",
-            "oich_PE": "PE_OI_Chng"
-        })
-
-        return df_pivot.to_json(orient="records")
-
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-# ===== Fyers Authentication Routes =====
-@app.route("/fyers_auth", methods=["GET", "POST"])
-@login_required
-def fyers_auth():
-    """Fyers authentication page with login button"""
-    username = session['username']
-    creds = get_user_credentials(username)
-    user_sess = get_user_session(username)
-    
-    if request.method == "POST":
-        if not creds or not creds['client_id'] or not creds['secret_key']:
-            return render_template_string(FYERS_AUTH_TEMPLATE, 
-                                         error="Please setup your Fyers credentials first!",
-                                         show_login_button=False)
-        
-        appSession = fyersModel.SessionModel(
-            client_id=creds['client_id'],
-            secret_key=creds['secret_key'],
-            redirect_uri=user_sess['redirect_uri'],
-            response_type="code",
-            grant_type="authorization_code",
-            state="sample"
-        )
-        
-        login_url = appSession.generate_authcode()
-        return redirect(login_url)
-    
-    # Check if Fyers is already initialized
-    is_authenticated = user_sess['fyers'] is not None
-    
-    return render_template_string(FYERS_AUTH_TEMPLATE, 
-                                is_authenticated=is_authenticated,
-                                show_login_button=True)
-
-# ---- Fyers Functions ----
-def init_fyers_for_user(username, client_id, secret_key, auth_code):
-    user_sess = get_user_session(username)
-    try:
-        appSession = fyersModel.SessionModel(
-            client_id=client_id,
-            secret_key=secret_key,
-            redirect_uri=user_sess['redirect_uri'],
-            response_type="code",
-            grant_type="authorization_code",
-            state="sample"
-        )
-        appSession.set_token(auth_code)
-        token_response = appSession.generate_token()
-        access_token = token_response.get("access_token")
-        if not access_token:
-            print(f"❌ Failed to get access token for {username}")
-            return False
-
-        user_sess['fyers'] = fyersModel.FyersModel(
-            client_id=client_id,
-            token=access_token,
-            is_async=False,
-            log_path=""
-        )
-        print(f"✅ Fyers initialized for {username}")
-        return True
-    except Exception as e:
-        print(f"❌ Failed to init Fyers for {username}:", e)
-        return False
-
-def set_atm_strike(username):
-    """Set ATM strike based on current market price"""
-    user_sess = get_user_session(username)
-    
-    if user_sess['fyers'] is None:
-        print(f"❌ Fyers not initialized for {username}")
-        return False
-    
-    try:
-        data = {"symbol": user_sess['selected_index'], "strikecount": 20, "timestamp": ""}
-        response = user_sess['fyers'].optionchain(data=data)
-        
-        if "data" not in response or "optionsChain" not in response["data"]:
-            print(f"❌ Failed to get option chain for ATM calculation for {username}")
-            return False
-            
-        options_data = response["data"]["optionsChain"]
-        if not options_data:
-            print(f"❌ No options data for ATM calculation for {username}")
-            return False
-            
-        df = pd.DataFrame(options_data)
-        nifty_spot = response["data"].get("underlyingValue", None)
-        
-        if nifty_spot is None:
-            nifty_spot = df["strike_price"].iloc[len(df) // 2]
-        
-        user_sess['atm_strike'] = min(df["strike_price"], key=lambda x: abs(x - nifty_spot))
-        
-        df_pivot = df.pivot_table(
-            index="strike_price",
-            columns="option_type",
-            values=["ltp", "ltpch", "oich", "volume", "oi"],  # Added 'oi' for Open Interest
-            aggfunc="first"
-        ).reset_index()
-        
-        df_pivot.columns = [f"{col[0]}_{col[1]}" if col[1] else col[0] for col in df_pivot.columns]
-        df_pivot = df_pivot.rename(columns={
-            "ltp_CE": "CE_LTP",
-            "ltp_PE": "PE_LTP",
-            "ltpch_CE": "CE_Chng",
-            "ltpch_PE": "PE_Chng",
-            "oich_CE": "CE_OI_Chng",
-            "oich_PE": "PE_OI_Chng",
-            "volume_CE": "CE_VOLUME",
-            "volume_PE": "PE_VOLUME",
-            "oi_CE": "CE_OI",
-            "oi_PE": "PE_OI"
-        })
-        
-        user_sess['initial_data'] = df_pivot.to_dict(orient="records")
-        user_sess['signals'].clear()
-        user_sess['placed_orders'].clear()
-        
-        print(f"✅ ATM strike set to {user_sess['atm_strike']} for {username}")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error setting ATM strike for {username}: {e}")
-        return False
-
-def place_mstock_order(username, symbol, transaction_type, quantity, order_type="MARKET", price=0, product="MIS"):
-    """Place an order with mStock broker"""
-    user_sess = get_user_session(username)
-    creds = get_user_credentials(username)
-    access_token = user_sess.get('mstock_access_token')
-    
-    if not access_token:
-        print(f"❌ mStock not authenticated for {username}")
-        return None
-    
-    try:
-        # Prepare order data
-        data = {
-            'tradingsymbol': symbol,
-            'exchange': 'NFO',  # Assuming NFO for options
-            'transaction_type': transaction_type,  # BUY or SELL
-            'order_type': order_type,  # MARKET, LIMIT, etc.
-            'quantity': quantity,
-            'product': product,  # MIS for intraday
-            'validity': 'DAY',
-            'price': price,
-            'variety': 'regular'  # Regular order
-        }
-        
-        # Prepare headers
-        headers = {
-            'X-Mirae-Version': '1',
-            'Authorization': f'token {creds["mstock_api_key"]}:{access_token}',
-            'Content-Type': 'application/x-www-form-urlencoded',
-        }
-        
-        # Make API request
-        response = requests.post(
-            f'https://api.mstock.trade/openapi/typea/orders/regular',
-            headers=headers,
-            data=data
-        )
-        
-        resp_json = response.json()
-        
-        if resp_json.get("status") == "success":
-            order_id = resp_json.get("data", {}).get("orderid")
-            print(f"✅ mStock order placed for {username}: {order_id}")
-            
-            return {
-                "status": "success",
-                "order_id": order_id,
-                "broker": "mStock"
-            }
-        else:
-            error_message = resp_json.get("message", "Failed to place order")
-            print(f"❌ mStock order failed for {username}: {error_message}")
-            return {
-                "status": "error",
-                "message": error_message,
-                "broker": "mStock"
-            }
-            
-    except Exception as e:
-        print(f"❌ mStock order error for {username}: {e}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "broker": "mStock"
-        }
-
-def place_order(username, symbol, price, side):
-    """Place order with both Fyers and mStock brokers"""
-    user_sess = get_user_session(username)
-    fyers_response = None
-    mstock_response = None
-    
-    # Place order with Fyers (existing code)
-    try:
-        if user_sess['fyers'] is None:
-            print(f"❌ Fyers not initialized for {username}")
-            fyers_response = {"status": "error", "message": "Fyers not initialized"}
-        else:
-            data = {
-                "symbol": symbol,
-                "qty": user_sess['quantity'],
-                "type": 1,
-                "side": side,
-                "productType": "INTRADAY",
-                "limitPrice": price,
-                "stopPrice": 0,
-                "validity": "DAY",
-                "disclosedQty": 0,
-                "offlineOrder": False,
-                "orderTag": "signalorder"
-            }
-            fyers_response = user_sess['fyers'].place_order(data=data)
-            print(f"✅ Fyers order placed for {username}:", fyers_response)
-    except Exception as e:
-        print(f"❌ Fyers order error for {username}:", e)
-        fyers_response = {"status": "error", "message": str(e)}
-    
-    # Place order with mStock
-    try:
-        # Convert Fyers symbol format to mStock format if needed
-        mstock_symbol = symbol
-        if ":" in symbol:  # Convert NSE:NIFTY25-25000CE to NIFTY25N1124500CE format
-            parts = symbol.split(":")
-            if len(parts) > 1:
-                mstock_symbol = parts[1].replace("-", "")
-        
-        # Convert side (1=BUY, -1=SELL) to transaction_type
-        transaction_type = "BUY" if side == 1 else "SELL"
-        
-        # Place the order with mStock
-        mstock_response = place_mstock_order(
-            username, 
-            mstock_symbol, 
-            transaction_type, 
-            user_sess['quantity'],
-            order_type="LIMIT" if price > 0 else "MARKET",
-            price=price
-        )
-    except Exception as e:
-        print(f"❌ mStock order error for {username}:", e)
-        mstock_response = {"status": "error", "message": str(e), "broker": "mStock"}
-    
-    # Return both responses
-    return {
-        "fyers": fyers_response,
-        "mstock": mstock_response
-    }
-
-def process_option_chain(username, df_pivot, response):
-    """Process option chain data and place orders with both brokers if conditions are met"""
-    user_sess = get_user_session(username)
-
-    if user_sess['atm_strike'] is None:
-        print(f"❌ ATM strike not set for {username}")
-        return
-
-    ce_target_strike = user_sess['atm_strike'] + user_sess['ce_offset']
-    pe_target_strike = user_sess['atm_strike'] + user_sess['pe_offset']
-
-    for row in df_pivot.itertuples():
-        strike = row.strike_price
-        ce_ltp = getattr(row, "CE_LTP", None)
-        pe_ltp = getattr(row, "PE_LTP", None)
-
-        if strike == ce_target_strike and ce_ltp is not None:
-            initial_ce = next((item["CE_LTP"] for item in user_sess['initial_data'] if item["strike_price"] == strike), None)
-            if initial_ce is not None and ce_ltp > initial_ce + user_sess['atm_ce_plus20']:
-                signal_name = f"CE_OFFSET_{strike}"
-                if signal_name not in user_sess['placed_orders']:
-                    user_sess['signals'].append(f"{strike} {ce_ltp} CE Offset Strike")
-                    # Place order with both brokers
-                    place_order(username, f"{user_sess['symbol_prefix']}{strike}CE", ce_ltp, side=1)
-                    user_sess['placed_orders'].add(signal_name)
-
-        if strike == pe_target_strike and pe_ltp is not None:
-            initial_pe = next((item["PE_LTP"] for item in user_sess['initial_data'] if item["strike_price"] == strike), None)
-            if initial_pe is not None and pe_ltp > initial_pe + user_sess['atm_pe_plus20']:
-                signal_name = f"PE_OFFSET_{strike}"
-                if signal_name not in user_sess['placed_orders']:
-                    user_sess['signals'].append(f"{strike} {pe_ltp} PE Offset Strike")
-                    # Place order with both brokers
-                    place_order(username, f"{user_sess['symbol_prefix']}{strike}PE", pe_ltp, side=1)
-                    user_sess['placed_orders'].add(signal_name)
-
-def background_bot_worker(username):
-    """Background bot worker that processes option chain and places orders"""
-    user_sess = get_user_session(username)
-    print(f"🤖 Background bot started for {username}")
-
-    while user_sess['bot_running']:
-        if user_sess['fyers'] is None:
-            time.sleep(5)
-            continue
-
-        try:
-            data = {"symbol": user_sess['selected_index'], "strikecount": 20, "timestamp": ""}
-            response = user_sess['fyers'].optionchain(data=data)
-
-            if "data" not in response or "optionsChain" not in response["data"]:
-                time.sleep(2)
-                continue
-
-            options_data = response["data"]["optionsChain"]
-            if not options_data:
-                time.sleep(2)
-                continue
-
-            df = pd.DataFrame(options_data)
-
-            df_pivot = df.pivot_table(
-                index="strike_price",
-                columns="option_type",
-                values=["ltp", "ltpch", "oich", "volume", "oi"],  # Added 'oi' for Open Interest
-                aggfunc="first"
-            ).reset_index()
-
-            df_pivot.columns = [f"{col[0]}_{col[1]}" if col[1] else col[0] for col in df_pivot.columns]
-
-            df_pivot = df_pivot.rename(columns={
-                "ltp_CE": "CE_LTP",
-                "ltp_PE": "PE_LTP",
-                "ltpch_CE": "CE_Chng",
-                "ltpch_PE": "PE_Chng",
-                "oich_CE": "CE_OI_Chng",
-                "oich_PE": "PE_OI_Chng",
-                "volume_CE": "CE_VOLUME",
-                "volume_PE": "PE_VOLUME",
-                "oi_CE": "CE_OI",
-                "oi_PE": "PE_OI"
-            })
-
-            process_option_chain(username, df_pivot, response)
-
-        except Exception as e:
-            print(f"❌ Background bot error for {username}: {e}")
-
-        time.sleep(2)
-
-    print(f"🤖 Background bot stopped for {username}")
-
-# ---- Auth Routes ----
-@app.route('/sp', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        email = request.form.get('email')
-
-        if not username or not password or not email:
-            return render_template_string(SIGNUP_TEMPLATE, error="All fields are required!")
-
-        if get_user(username):
-            return render_template_string(SIGNUP_TEMPLATE, error="Username already exists!")
-
-        save_user(username, password, email)
-        return redirect(url_for('login_page'))
-
-    return render_template_string(SIGNUP_TEMPLATE)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login_page():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-
-        user = verify_user(username, password)
-
-        if user:
-            session['username'] = user['username']
-            session['email'] = user['email']
-
-            creds = get_user_credentials(username)
-            if creds and creds['client_id'] and creds['secret_key'] and creds['auth_code']:
-                if init_fyers_for_user(username, creds['client_id'], creds['secret_key'], creds['auth_code']):
-                    set_atm_strike(username)
-
-            return redirect(url_for('index'))
-        else:
-            return render_template_string(LOGIN_TEMPLATE, error="Invalid credentials!")
-
-    return render_template_string(LOGIN_TEMPLATE)
-
-@app.route('/logout')
-def logout():
-    username = session.get('username')
-    if username and username in user_sessions:
-        user_sessions[username]['bot_running'] = False
-    session.clear()
-    return redirect(url_for('login_page'))
-
-# ---- Main App Routes ----
-@app.route("/", methods=["GET", "POST"])
-@login_required
-def index():
-    username = session['username']
-    user_sess = get_user_session(username)
-    
-    # Check Fyers authentication status
-    fyers_authenticated = user_sess['fyers'] is not None
-
-    if request.method == "POST":
-        try:
-            user_sess['atm_ce_plus20'] = float(request.form.get("atm_ce_plus20", 20))
-        except (ValueError, TypeError):
-            user_sess['atm_ce_plus20'] = 20
-        try:
-            user_sess['atm_pe_plus20'] = float(request.form.get("atm_pe_plus20", 20))
-        except (ValueError, TypeError):
-            user_sess['atm_pe_plus20'] = 20
-        try:
-            user_sess['quantity'] = int(request.form.get("quantity", 75))
-        except (ValueError, TypeError):
-            user_sess['quantity'] = 75
-        try:
-            user_sess['ce_offset'] = int(request.form.get("ce_offset", -300))
-        except (ValueError, TypeError):
-            user_sess['ce_offset'] = -300
-        try:
-            user_sess['pe_offset'] = int(request.form.get("pe_offset", 300))
-        except (ValueError, TypeError):
-            user_sess['pe_offset'] = 300
-
-        prefix = request.form.get("symbol_prefix")
-        if prefix:
-            user_sess['symbol_prefix'] = prefix.strip()
-
-    if user_sess['atm_strike'] is None and user_sess['fyers'] is not None:
-        set_atm_strike(username)
-
-    return render_template_string(
-        MAIN_TEMPLATE,
-        atm_ce_plus20=user_sess['atm_ce_plus20'],
-        atm_pe_plus20=user_sess['atm_pe_plus20'],
-        symbol_prefix=user_sess['symbol_prefix'],
-        bot_running=user_sess['bot_running'],
-        username=username,
-        quantity=user_sess['quantity'],
-        ce_offset=user_sess['ce_offset'],
-        pe_offset=user_sess['pe_offset'],
-        atm_strike=user_sess['atm_strike'],
-        fyers_authenticated=fyers_authenticated
-    )
-
-@app.route("/setup_credentials", methods=["GET", "POST"])
-@login_required
-def setup_credentials():
-    username = session['username']
-    creds = get_user_credentials(username)
-
-    if request.method == "POST":
-        client_id = request.form.get("client_id")
-        secret_key = request.form.get("secret_key")
-        mstock_api_key = request.form.get("mstock_api_key")
-
-        if client_id and secret_key:
-            save_user_credentials(username, client_id=client_id, secret_key=secret_key, mstock_api_key=mstock_api_key)
-            return redirect(url_for('fyers_login'))
-
-    return render_template_string(CREDENTIALS_TEMPLATE,
-                                   client_id=creds['client_id'] if creds else "",
-                                   secret_key=creds['secret_key'] if creds else "",
-                                   mstock_api_key=creds['mstock_api_key'] if creds else "")
-
-@app.route("/fyers_login")
-@login_required
-def fyers_login():
-    username = session['username']
-    creds = get_user_credentials(username)
-    user_sess = get_user_session(username)
-
-    if not creds or not creds['client_id'] or not creds['secret_key']:
-        return redirect(url_for('setup_credentials'))
-
-    appSession = fyersModel.SessionModel(
-        client_id=creds['client_id'],
-        secret_key=creds['secret_key'],
-        redirect_uri=user_sess['redirect_uri'],
-        response_type="code",
-        grant_type="authorization_code",
-        state="sample"
-    )
-
-    login_url = appSession.generate_authcode()
-    webbrowser.open(login_url, new=1)
-    return redirect(login_url)
-
-@app.route("/callback/<username>")
-def callback(username):
-    auth_code = request.args.get("auth_code")
-    if auth_code:
-        creds = get_user_credentials(username)
-        if creds:
-            save_user_credentials(username, auth_code=auth_code)
-            if init_fyers_for_user(username, creds['client_id'], creds['secret_key'], auth_code):
-                set_atm_strike(username)
-                return "<h2>✅ Authentication Successful! You can return to app 🚀</h2>"
-    return "❌ Authentication failed. Please retry."
-
-@app.route("/fetch")
-@login_required
-def fetch_option_chain():
-    username = session['username']
-    user_sess = get_user_session(username)
-
-    if user_sess['fyers'] is None:
-        return jsonify({"error": "⚠ Please setup credentials and login first!"})
-
-    if user_sess['atm_strike'] is None:
-        if not set_atm_strike(username):
-            return jsonify({"error": "Failed to set ATM strike. Please try again."})
-
-    try:
-        data = {"symbol": user_sess['selected_index'], "strikecount": 20, "timestamp": ""}
-        response = user_sess['fyers'].optionchain(data=data)
-
-        if "data" not in response or "optionsChain" not in response["data"]:
-            return jsonify({"error": f"Invalid response from API"})
-
-        options_data = response["data"]["optionsChain"]
-        if not options_data:
-            return jsonify({"error": "No options data found!"})
-
-        df = pd.DataFrame(options_data)
-
-        df_pivot = df.pivot_table(
-            index="strike_price",
-            columns="option_type",
-            values=["ltp", "ltpch", "oich", "volume", "oi"],  # Added 'oi' for Open Interest
-            aggfunc="first"
-        ).reset_index()
-
-        df_pivot.columns = [f"{col[0]}_{col[1]}" if col[1] else col[0] for col in df_pivot.columns]
-
-        df_pivot = df_pivot.rename(columns={
-            "ltp_CE": "CE_LTP",
-            "ltp_PE": "PE_LTP",
-            "ltpch_CE": "CE_Chng",
-            "ltpch_PE": "PE_Chng",
-            "oich_CE": "CE_OI_Chng",
-            "oich_PE": "PE_OI_Chng",
-            "volume_CE": "CE_VOLUME",
-            "volume_PE": "PE_VOLUME",
-            "oi_CE": "CE_OI",
-            "oi_PE": "PE_OI"
-        })
-
-        process_option_chain(username, df_pivot, response)
-
-        result = df_pivot.to_json(orient="records")
-        result_dict = json.loads(result)
-        result_dict.append({"atm_strike": user_sess['atm_strike']})
-        
-        return jsonify(result_dict)
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-@app.route("/start_bot", methods=["POST"])
-@login_required
-def start_bot():
-    username = session['username']
-    user_sess = get_user_session(username)
-
-    if user_sess['fyers'] is None:
-        return jsonify({"error": "⚠️ Please login first!"})
-
-    if user_sess['bot_running']:
-        return jsonify({"error": "⚠️ Bot is already running!"})
-
-    if user_sess['atm_strike'] is None:
-        if not set_atm_strike(username):
-            return jsonify({"error": "Failed to set ATM strike. Please try again."})
-
-    user_sess['bot_running'] = True
-    user_sess['bot_thread'] = threading.Thread(target=background_bot_worker, args=(username,), daemon=True)
-    user_sess['bot_thread'].start()
-
-    return jsonify({"message": "✅ Bot started! Running in background!"})
-
-@app.route("/stop_bot", methods=["POST"])
-@login_required
-def stop_bot():
-    username = session['username']
-    user_sess = get_user_session(username)
-    user_sess['bot_running'] = False
-    return jsonify({"message": "✅ Bot stopped!"})
-
-@app.route("/bot_status")
-@login_required
-def bot_status():
-    username = session['username']
-    user_sess = get_user_session(username)
-    return jsonify({
-        "running": user_sess['bot_running'],
-        "signals": user_sess['signals'],
-        "placed_orders": list(user_sess['placed_orders']),
-        "atm_strike": user_sess['atm_strike']
-    })
-
-@app.route("/reset", methods=["POST"])
-@login_required
-def reset_orders():
-    username = session['username']
-    user_sess = get_user_session(username)
-    
-    user_sess['placed_orders'].clear()
-    user_sess['signals'].clear()
-    user_sess['atm_strike'] = None
-    user_sess['initial_data'] = None
-    
-    if user_sess['fyers'] is not None:
-        set_atm_strike(username)
-    
-    return jsonify({"message": "✅ Reset successful! ATM strike updated."})
-
-# New routes for dual broker operations
-@app.route("/place_dual_order", methods=["POST"])
-@login_required
-def place_dual_order():
-    username = session['username']
-    
-    # Get order parameters from request
-    symbol = request.json.get('symbol')
-    price = float(request.json.get('price', 0))
-    side = int(request.json.get('side', 1))  # 1 for BUY, -1 for SELL
-    
-    if not symbol:
-        return jsonify({
-            "status": "error",
-            "message": "Symbol is required"
-        }), 400
-    
-    # Place orders with both brokers
-    response = place_order(username, symbol, price, side)
-    
-    # Check if at least one order was successful
-    fyers_success = response.get("fyers", {}).get("s") == "ok"
-    mstock_success = response.get("mstock", {}).get("status") == "success"
-    
-    if fyers_success or mstock_success:
-        return jsonify({
-            "status": "success",
-            "message": "Orders placed successfully",
-            "fyers": response.get("fyers"),
-            "mstock": response.get("mstock")
-        })
-    else:
-        return jsonify({
-            "status": "error",
-            "message": "Failed to place orders with both brokers",
-            "fyers": response.get("fyers"),
-            "mstock": response.get("mstock")
-        }), 400
-
-# ---- HTML Templates ----
-SIGNUP_TEMPLATE = """
+# It's crucial to change this secret key in a production environment
+app.secret_key = 'a_very_secret_and_random_string'
+
+# API Credentials - Replace with your actual credentials
+API_KEY = 'DKqtPSHqUjyoLfBD+WAfbkMa8Jx2WEaIfbCaOQWbIx0='
+API_SECRET = '<your_api_secret_here>'
+
+# Base URL for API
+# This is the correct base URL since 'session' endpoint works with it.
+# The 404 errors are due to incorrect endpoint *paths* for your API version.
+# You may need to find the correct paths for 'margins', 'positions', etc. from your specific API documentation.
+BASE_URL = 'https://api.mstock.trade/openapi/typea'
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =============================
+# HTML Templates
+# =============================
+
+# Main template with tabular formatting
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Sign Up</title>
+    <title>Mirae Asset Trading Platform</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-               display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-        .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 400px; }
-        h2 { color: #333; text-align: center; margin-bottom: 30px; }
-        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
-        button { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 5px;
-                 cursor: pointer; font-size: 16px; margin-top: 10px; }
-        button:hover { background: #5568d3; }
-        .error { color: red; text-align: center; margin-bottom: 10px; }
-        .link { text-align: center; margin-top: 20px; }
-        .link a { color: #667eea; text-decoration: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>📝 Sign Up</h2>
-        {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        <form method="POST">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="email" name="email" placeholder="Email" required>
-            <input type="password" name="password" placeholder="Password" minlength="6" required>
-            <button type="submit">Create Account</button>
-        </form>
-        <div class="link">Already have an account? <a href="/login">Login</a></div>
-    </div>
-</body>
-</html>
-"""
-
-LOGIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Login</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-               display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-        .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.2); width: 400px; }
-        h2 { color: #333; text-align: center; margin-bottom: 30px; }
-        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
-        button { width: 100%; padding: 12px; background: #667eea; color: white; border: none; border-radius: 5px;
-                 cursor: pointer; font-size: 16px; margin-top: 10px; }
-        button:hover { background: #5568d3; }
-        .error { color: red; text-align: center; margin-bottom: 10px; }
-        .link { text-align: center; margin-top: 20px; }
-        .link a { color: #667eea; text-decoration: none; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>🔐 Login</h2>
-        {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        <form method="POST">
-            <input type="text" name="username" placeholder="Username" required>
-            <input type="password" name="password" placeholder="Password" required>
-            <button type="submit">Login</button>
-        </form>
-        <div class="link">Don't have an account? contact Sajid Shaikh for Sign Up</div>
-    </div>
-</body>
-</html>
-"""
-
-CREDENTIALS_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Setup Credentials</title>
-    <style>
-        body { font-family: Arial, sans-serif; background: #f4f4f9; padding: 20px; }
-        .container { max-width: 600px; margin: 50px auto; background: white; padding: 40px;
-                     border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h2 { color: #1a73e8; text-align: center; }
-        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
-        button { width: 100%; padding: 12px; background: #1a73e8; color: white; border: none;
-                 border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 10px; }
-        .info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .section { margin-bottom: 25px; }
-        .section h3 { color: #333; margin-bottom: 10px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>🔑 Setup API Credentials</h2>
-        
-        <div class="section">
-            <h3>Fyers API Credentials</h3>
-            <div class="info"><strong>Note:</strong> Enter your Fyers API credentials.</div>
-            <form method="POST">
-                <input type="text" name="client_id" placeholder="Fyers Client ID" value="{{ client_id }}" required>
-                <input type="text" name="secret_key" placeholder="Fyers Secret Key" value="{{ secret_key }}" required>
-        </div>
-        
-        <div class="section">
-            <h3>mStock API Credentials</h3>
-            <div class="info"><strong>Note:</strong> Enter your mStock API Key. The API secret is fixed.</div>
-                <input type="text" name="mstock_api_key" placeholder="mStock API Key" value="{{ mstock_api_key }}" required>
-                <button type="submit">Save & Continue to Login</button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-MSTOCK_AUTH_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>m.Stock OTP Authentication</title>
-    <style>
-        body { font-family: Arial; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
-        .container { background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h2, h3 { text-align: center; }
-        .form-container { background-color: #f9f9f9; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1, h2, h3 { color: #333; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="text"], input[type="submit"] { width: 100%; padding: 12px; border-radius: 4px; font-size: 16px; }
-        input[type="submit"] { background-color: #4CAF50; color: white; border: none; cursor: pointer; }
-        input[type="submit"]:hover { background-color: #45a049; }
-        .success { color: green; background-color: #dff0d8; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .error { color: red; background-color: #f2dede; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .token-info { background-color: #e9f7ef; padding: 15px; border-radius: 5px; margin-bottom: 20px; word-break: break-all; }
-        .logout-btn { background-color: #f44336; }
-        .logout-btn:hover { background-color: #d32f2f; }
-        .hidden { display: none; }
-        .back-link { text-align: center; margin-top: 20px; }
-        .back-link a { color: #667eea; text-decoration: none; }
-        .api-key-info { background-color: #e3f2fd; padding: 10px; border-radius: 5px; margin-bottom: 20px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>m.Stock API Authentication</h2>
-        
-        {% if mstock_api_key %}
-            <div class="api-key-info">
-                <strong>Using API Key:</strong> {{ mstock_api_key }}
-            </div>
-        {% else %}
-            <div class="error">
-                <strong>Error:</strong> mStock API key not configured. Please <a href="/setup_credentials">setup your mStock credentials</a> first.
-            </div>
-        {% endif %}
-
-        <div id="otp-section" class="form-container {% if access_token %}hidden{% endif %}">
-            <h3>Enter OTP to Generate Session</h3>
-            <form method="POST">
-                <div class="form-group">
-                    <label for="totp">OTP:</label>
-                    <input type="text" id="totp" name="totp" required placeholder="Enter your OTP">
-                </div>
-                <input type="submit" value="Verify OTP">
-            </form>
-        </div>
-
-        {% if access_token %}
-            <div class="success">
-                <h3>✅ Authentication Successful!</h3>
-            </div>
-
-            <div class="token-info">
-                <p><strong>Access Token:</strong> {{ access_token }}</p>
-            </div>
-
-            <div class="form-container">
-                <a href="/mstock_option_chain" style="text-decoration:none;">
-                    <input type="button" value="View Option Chain" style="background:#007bff;color:white;cursor:pointer;">
-                </a>
-            </div>
-
-            <div class="form-container">
-                <form method="POST" action="/mstock/logout">
-                    <input type="submit" value="Logout" class="logout-btn">
-                </form>
-            </div>
-        {% elif error %}
-            <div class="error">
-                <strong>Error:</strong> {{ error }}
-            </div>
-        {% endif %}
-
-        <div class="back-link">
-            <a href="/">← Back to Main Dashboard</a>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-MSTOCK_OPTION_CHAIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>m.Stock Option Chain</title>
-  <style>
-    body { font-family: Arial, sans-serif; background: #f7f7f7; padding: 20px; }
-    h2 { color: #007bff; text-align: center; }
-    table { border-collapse: collapse; width: 95%; margin: 20px auto; font-size: 12px; }
-    th, td { border: 1px solid #aaa; padding: 6px; text-align: center; }
-    th { background-color: #007bff; color: white; }
-    tr:nth-child(even) { background-color: #f2f2f2; }
-    .back-link { text-align: center; margin-top: 20px; }
-    .back-link a { color: #667eea; text-decoration: none; }
-    .strike-column { font-weight: bold; min-width: 60px; }
-    .ltp-column { min-width: 60px; }
-    .change-column { min-width: 60px; font-weight: bold; }
-    .oi-column { min-width: 70px; font-weight: bold; }
-    .volume-column { min-width: 70px; }
-    .negative { color: red; }
-    .positive { color: green; }
-    .section-header { background-color: #e9ecef; font-weight: bold; }
-  </style>
-  <script>
-    function formatNumber(num) {
-        if (num === null || num === undefined || num === '-') return '-';
-        return parseInt(num).toLocaleString();
-    }
-    
-    function formatChange(num) {
-        if (num === null || num === undefined || num === '-') return '-';
-        const value = parseFloat(num);
-        const formatted = value > 0 ? `+${value.toFixed(2)}` : value.toFixed(2);
-        const className = value < 0 ? 'negative' : 'positive';
-        return `<span class="${className}">${formatted}</span>`;
-    }
-
-    async function fetchChain(){
-        let res = await fetch("/fetch_mstock_option_chain");
-        let data = await res.json();
-        let tbl = document.getElementById("chain");
-        tbl.innerHTML = "";
-
-        if(data.error){
-            tbl.innerHTML = `<tr><td colspan="9">${data.error}</td></tr>`;
-            return;
-        }
-
-        data.forEach(row=>{
-            tbl.innerHTML += `<tr>
-                <td class="strike-column">${row.strike_price}</td>
-                <td class="ltp-column">${row.CE_LTP || '-'}</td>
-                <td class="change-column">${formatChange(row.CE_Chng)}</td>
-                <td class="oi-column">${formatNumber(row.CE_OI)}</td>
-                <td class="change-column">${formatChange(row.CE_OI_Chng)}</td>
-                <td class="volume-column">${formatNumber(row.CE_VOLUME)}</td>
-                <td class="volume-column">${formatNumber(row.PE_VOLUME)}</td>
-                <td class="change-column">${formatChange(row.PE_OI_Chng)}</td>
-                <td class="oi-column">${formatNumber(row.PE_OI)}</td>
-                <td class="change-column">${formatChange(row.PE_Chng)}</td>
-                <td class="ltp-column">${row.PE_LTP || '-'}</td>
-            </tr>`;
-        });
-    }
-
-    setInterval(fetchChain, 3000);
-    window.onload = fetchChain;
-  </script>
-</head>
-<body>
-  <h2>Live NIFTY50 Option Chain (m.Stock)</h2>
-  <table>
-    <thead>
-        <tr>
-            <th rowspan="2">Strike</th>
-            <th colspan="5" class="section-header">Call Option</th>
-            <th colspan="5" class="section-header">Put Option</th>
-        </tr>
-        <tr>
-            <th>LTP</th>
-            <th>Change</th>
-            <th>OI</th>
-            <th>OI Chg</th>
-            <th>Volume</th>
-            <th>Volume</th>
-            <th>OI Chg</th>
-            <th>OI</th>
-            <th>Change</th>
-            <th>LTP</th>
-        </tr>
-    </thead>
-    <tbody id="chain"></tbody>
-  </table>
-  <div class="back-link">
-    <a href="/mstock_auth">← Back to mStock Authentication</a> | 
-    <a href="/">← Main Dashboard</a>
-  </div>
-</body>
-</html>
-"""
-
-FYERS_AUTH_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Fyers Authentication</title>
-    <style>
-        body { font-family: Arial; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
-        .container { background-color: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h2, h3 { text-align: center; }
-        .form-container { background-color: #f9f9f9; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input[type="text"], input[type="submit"] { width: 100%; padding: 12px; border-radius: 4px; font-size: 16px; }
-        input[type="submit"] { background-color: #007bff; color: white; border: none; cursor: pointer; }
-        input[type="submit"]:hover { background-color: #0069d9; }
-        .success { color: green; background-color: #dff0d8; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .error { color: red; background-color: #f2dede; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
-        .logout-btn { background-color: #dc3545; }
-        .logout-btn:hover { background-color: #c82333; }
-        .hidden { display: none; }
-        .back-link { text-align: center; margin-top: 20px; }
-        .back-link a { color: #667eea; text-decoration: none; }
-        .auth-status { text-align: center; margin: 20px 0; }
-        .status-badge { padding: 5px 15px; border-radius: 20px; font-weight: bold; }
-        .status-success { background-color: #d4edda; color: #155724; }
-        .status-warning { background-color: #fff3cd; color: #856404; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Fyers API Authentication</h2>
-        
-        {% if is_authenticated %}
-            <div class="auth-status">
-                <span class="status-badge status-success">✅ Fyers is Authenticated</span>
-            </div>
-        {% else %}
-            <div class="auth-status">
-                <span class="status-badge status-warning">⚠️ Fyers is Not Authenticated</span>
-            </div>
-        {% endif %}
-
-        {% if show_login_button and not is_authenticated %}
-            <div class="form-container">
-                <h3>Login to Fyers</h3>
-                <form method="POST">
-                    <input type="submit" value="Login with Fyers">
-                </form>
-            </div>
-        {% endif %}
-
-        {% if error %}
-            <div class="error">
-                <strong>Error:</strong> {{ error }}
-            </div>
-        {% endif %}
-
-        <div class="back-link">
-            <a href="/">← Back to Main Dashboard</a>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-MAIN_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Algo Trading Bot - Sajid Shaikh</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
-        .header { background: rgba(255,255,255,0.95); padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .header h1 { color: #333; text-align: center; }
-        .nav { text-align: center; margin-top: 10px; }
-        .nav a { margin: 0 15px; color: #667eea; text-decoration: none; font-weight: bold; }
-        .nav a:hover { text-decoration: underline; }
-        .container { max-width: 1600px; margin: 20px auto; padding: 0 20px; }
-        .card { background: white; border-radius: 10px; padding: 25px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        .card h2 { color: #333; margin-bottom: 20px; border-bottom: 2px solid #667eea; padding-bottom: 10px; }
-        .form-group { margin-bottom: 15px; }
-        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; color: #555; }
-        .form-group input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-size: 14px; }
-        .form-row { display: flex; gap: 15px; }
-        .form-row .form-group { flex: 1; }
-        .btn { padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; font-weight: bold; margin-right: 10px; margin-bottom: 10px; }
-        .btn-primary { background: #667eea; color: white; }
-        .btn-success { background: #28a745; color: white; }
-        .btn-danger { background: #dc3545; color: white; }
-        .btn-warning { background: #ffc107; color: black; }
-        .btn-info { background: #17a2b8; color: white; }
-        .btn:hover { opacity: 0.9; }
-        .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
-        .status-success { background: #d4edda; color: #155724; }
-        .status-error { background: #f8d7da; color: #721c24; }
-        .status-info { background: #d1ecf1; color: #0c5460; }
-        .table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 12px; }
-        .table th, .table td { padding: 8px; text-align: center; border-bottom: 1px solid #ddd; }
-        .table th { background: #f8f9fa; font-weight: bold; }
-        .table tr:hover { background: #f5f5f5; }
-        .atm-strike { font-size: 18px; font-weight: bold; color: #667eea; text-align: center; margin: 15px 0; }
-        .signals { max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; border-radius: 5px; }
-        .signal-item { padding: 5px; margin: 2px 0; background: #e9ecef; border-radius: 3px; }
-        .user-info { text-align: right; color: #666; font-size: 14px; }
-        .auth-status { text-align: center; margin: 20px 0; }
-        .status-badge { padding: 5px 15px; border-radius: 20px; font-weight: bold; }
-        .status-success { background-color: #d4edda; color: #155724; }
-        .status-warning { background-color: #fff3cd; color: #856404; }
-        
-        /* Option chain styling */
-        .strike-column { font-weight: bold; min-width: 60px; }
-        .ltp-column { min-width: 60px; }
-        .change-column { min-width: 60px; font-weight: bold; }
-        .oi-column { min-width: 70px; font-weight: bold; }
-        .volume-column { min-width: 70px; }
-        .negative { color: red; }
-        .positive { color: green; }
-        .section-header { background-color: #e9ecef; font-weight: bold; }
-        
-        /* Highlighting styles for option chain */
-        .atm-row {
-            background-color: #e3f2fd !important;
-            font-weight: bold;
-        }
-
-        .ce-offset-row {
-            background-color: #e8f5e9 !important;
-            font-weight: bold;
-        }
-
-        .pe-offset-row {
-            background-color: #fff3e0 !important;
-            font-weight: bold;
-        }
-
-        .row-label {
-            display: inline-block;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 12px;
-            margin-right: 5px;
-            font-weight: bold;
-            color: white;
-        }
-
-        .atm-row .row-label {
-            background-color: #2196f3;
-        }
-
-        .ce-offset-row .row-label {
-            background-color: #4caf50;
-        }
-
-        .pe-offset-row .row-label {
-            background-color: #ff9800;
+        input, select { padding: 8px; width: 100%; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        button { background-color: #4CAF50; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #45a049; }
+        button.logout { background-color: #f44336; }
+        button.logout:hover { background-color: #d32f2f; }
+        button.squareoff-all { background-color: #FF5722; margin-bottom: 10px; }
+        button.squareoff-all:hover { background-color: #E64A19; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #4CAF50; color: white; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        .nav { margin-bottom: 20px; }
+        .nav button { margin-right: 10px; }
+        .message { padding: 10px; margin: 10px 0; border-radius: 4px; }
+        .success { background-color: #dff0d8; color: #3c763d; }
+        .error { background-color: #f2dede; color: #a94442; }
+        .tabs { display: flex; border-bottom: 1px solid #ddd; margin-bottom: 20px; }
+        .tab { padding: 10px 20px; cursor: pointer; background-color: #f1f1f1; border: 1px solid #ccc; border-bottom: none; margin-right: 5px; }
+        .tab.active { background-color: white; border-bottom: 1px solid white; margin-bottom: -1px; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .form-row { display: flex; gap: 20px; }
+        .form-col { flex: 1; }
+        .loading-indicator { text-align: center; padding: 20px; font-style: italic; color: #666; }
+        .action-cell button { margin-right: 5px; }
+        .notification { position: fixed; top: 20px; right: 20px; padding: 15px; border-radius: 4px; color: white; z-index: 1000; }
+        .notification.success { background-color: #4CAF50; }
+        .notification.error { background-color: #f44336; }
+        .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+        .status-indicator.online { background-color: #4CAF50; }
+        .status-indicator.offline { background-color: #f44336; }
+        .status-indicator.updating { background-color: #FF9800; animation: pulse 1s infinite; }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🚀 Algo Trading Bot - Sajid Shaikh (Dual Broker)</h1>
-        <div class="user-info">Logged in as: {{ username }}</div>
-        <div class="nav">
-            <a href="/">Dashboard</a>
-            <a href="/mstock_auth">mStock Auth</a>
-            <a href="/fyers_auth">Fyers Auth</a>
-            <a href="/setup_credentials">API Setup</a>
-            <a href="/logout">Logout</a>
-        </div>
-    </div>
-
     <div class="container">
-        <div class="card">
-            <h2>⚙️ Bot Configuration</h2>
-            <form method="POST">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>CE Offset Points:</label>
-                        <input type="number" name="ce_offset" value="{{ ce_offset }}" required>
-                    </div>
-                    <div class="form-group">
-                        <label>PE Offset Points:</label>
-                        <input type="number" name="pe_offset" value="{{ pe_offset }}" required>
-                    </div>
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>CE Trigger Points:</label>
-                        <input type="number" name="atm_ce_plus20" value="{{ atm_ce_plus20 }}" step="0.05" required>
-                    </div>
-                    <div class="form-group">
-                        <label>PE Trigger Points:</label>
-                        <input type="number" name="atm_pe_plus20" value="{{ atm_pe_plus20 }}" step="0.05" required>
-                    </div>
-                </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Quantity:</label>
-                        <input type="number" name="quantity" value="{{ quantity }}" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Symbol Prefix:</label>
-                        <input type="text" name="symbol_prefix" value="{{ symbol_prefix }}" required>
-                    </div>
-                </div>
-                <button type="submit" class="btn btn-primary">Save Configuration</button>
-            </form>
-        </div>
-
-        <div class="card">
-            <h2>📊 Market Data</h2>
-            <div class="auth-status">
-                {% if fyers_authenticated %}
-                    <span class="status-badge status-success">✅ Fyers is Authenticated</span>
-                {% else %}
-                    <span class="status-badge status-warning">⚠️ Fyers is Not Authenticated</span>
-                    <p>Please <a href="/fyers_auth">login with Fyers</a> to access market data</p>
+        <h1>Mirae Asset Trading Platform</h1>
+        
+        <!-- Flash Messages Block -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="message {{ category }}">{{ message }}</div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+        
+        {% if not access_token %}
+            <div class="tabs">
+                <div class="tab active" onclick="showTab('login')">Login</div>
+            </div>
+            
+            <div id="login" class="tab-content active">
+                <h2>Step 1: Verify OTP</h2>
+                {% if error %}
+                    <div class="message error">{{ error }}</div>
                 {% endif %}
+                <form method="post">
+                    <div class="form-group">
+                        <label for="totp">Enter OTP:</label>
+                        <input type="text" id="totp" name="totp" required>
+                    </div>
+                    <button type="submit">Verify OTP</button>
+                </form>
             </div>
-            {% if atm_strike %}
-                <div class="atm-strike">ATM Strike: {{ atm_strike }}</div>
-            {% endif %}
-            <button onclick="fetchOptionChain()" class="btn btn-info">Fetch Option Chain</button>
-            <button onclick="startBot()" class="btn btn-success">Start Bot</button>
-            <button onclick="stopBot()" class="btn btn-danger">Stop Bot</button>
-            <button onclick="resetBot()" class="btn btn-warning">Reset Bot</button>
-            <div id="status"></div>
-            <div id="option-chain"></div>
-        </div>
-
-        <div class="card">
-            <h2>📈 Trading Signals</h2>
-            <div id="signals" class="signals"></div>
-        </div>
+        {% else %}
+            <div class="tabs">
+                <div class="tab {% if active_tab == 'dashboard' %}active{% endif %}" onclick="showTab('dashboard')">Dashboard</div>
+                <div class="tab {% if active_tab == 'place_order' %}active{% endif %}" onclick="showTab('place_order')">Place Order</div>
+                <div class="tab {% if active_tab == 'order_book' %}active{% endif %}" onclick="showTab('order_book')">Order Book</div>
+                <div class="tab {% if active_tab == 'positions' %}active{% endif %}" onclick="showTab('positions')">Positions (Live)</div>
+                <div class="tab {% if active_tab == 'trades' %}active{% endif %}" onclick="showTab('trades')">Trades</div>
+            </div>
+            
+            <div id="dashboard" class="tab-content {% if active_tab == 'dashboard' %}active{% endif %}">
+                <h2>Dashboard</h2>
+                <div class="message success">
+                    <p><strong>Access Token:</strong> {{ access_token }}</p>
+                    <p><strong>Login Time:</strong> {{ login_time }}</p>
+                </div>
+                
+                <h3>Quick Actions</h3>
+                <div class="nav">
+                    <button onclick="showTab('place_order')">Place Order</button>
+                    <button onclick="showTab('order_book')">View Orders</button>
+                    <button onclick="showTab('positions')">View Positions</button>
+                </div>
+                
+                <h3>Account Summary</h3>
+                <table>
+                    <tr>
+                        <th>Segment</th>
+                        <th>Margin Used</th>
+                        <th>Margin Available</th>
+                    </tr>
+                    <tr>
+                        <td>Equity</td>
+                        <td>₹{{ margins.equity.used | default('N/A') }}</td>
+                        <td>₹{{ margins.equity.available | default('N/A') }}</td>
+                    </tr>
+                    <tr>
+                        <td>Commodity</td>
+                        <td>₹{{ margins.commodity.used | default('N/A') }}</td>
+                        <td>₹{{ margins.commodity.available | default('N/A') }}</td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div id="place_order" class="tab-content {% if active_tab == 'place_order' %}active{% endif %}">
+                <h2>Place Order</h2>
+                {% if order_response %}
+                    <div class="message {% if 'error' in order_response %}error{% else %}success{% endif %}">
+                        <h3>Order Response:</h3>
+                        <pre>{{ order_response | safe }}</pre>
+                    </div>
+                {% endif %}
+                
+                <form method="post" action="/place_order">
+                    <div class="form-row">
+                        <div class="form-col">
+                            <div class="form-group">
+                                <label for="tradingsymbol">Symbol:</label>
+                                <input type="text" id="tradingsymbol" name="tradingsymbol" value="NIFTY25" required>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="exchange">Exchange:</label>
+                                <select id="exchange" name="exchange">
+                                    <option value="NFO">NFO</option>
+                                    <option value="NSE">NSE</option>
+                                    <option value="BSE">BSE</option>
+                                    <option value="MCX">MCX</option>
+                                </select>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="transaction_type">Transaction Type:</label>
+                                <select id="transaction_type" name="transaction_type">
+                                    <option value="BUY">BUY</option>
+                                    <option value="SELL">SELL</option>
+                                </select>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="order_type">Order Type:</label>
+                                <select id="order_type" name="order_type" onchange="togglePriceField()">
+                                    <option value="LIMIT">LIMIT</option>
+                                    <option value="MARKET">MARKET</option>
+                                    <option value="SL">Stop Loss</option>
+                                    <option value="SL-M">Stop Loss Market</option>
+                                </select>
+                            </div>
+                        </div>
+                        
+                        <div class="form-col">
+                            <div class="form-group">
+                                <label for="quantity">Quantity:</label>
+                                <input type="number" id="quantity" name="quantity" value="75" required>
+                            </div>
+                            
+                            <div class="form-group" id="price_field">
+                                <label for="price">Price:</label>
+                                <input type="text" id="price" name="price" value="1">
+                            </div>
+                            
+                            <div class="form-group" id="trigger_field" style="display:none;">
+                                <label for="trigger_price">Trigger Price:</label>
+                                <input type="text" id="trigger_price" name="trigger_price" value="0">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="product">Product:</label>
+                                <select id="product" name="product">
+                                    <option value="CNC">CNC (Delivery)</option>
+                                    <option value="NRML">NRML (Normal)</option>
+                                    <option value="MIS">MIS (Intraday)NRML (Normal)</option>
+                                </select>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="validity">Validity:</label>
+                                <select id="validity" name="validity">
+                                    <option value="DAY">DAY</option>
+                                    <option value="IOC">IOC</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="variety">Variety:</label>
+                        <select id="variety" name="variety">
+                            <option value="regular">Regular</option>
+                            <option value="amo">AMO (After Market Order)</option>
+                            <option value="iceberg">Iceberg</option>
+                        </select>
+                    </div>
+                    
+                    <button type="submit">Place Order</button>
+                </form>
+            </div>
+            
+            <div id="order_book" class="tab-content {% if active_tab == 'order_book' %}active{% endif %}">
+                <h2>Order Book</h2>
+                <button onclick="refreshOrderBook()">Refresh</button>
+                
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Order ID</th>
+                            <th>Symbol</th>
+                            <th>Exchange</th>
+                            <th>Type</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                            <th>Trigger Price</th>
+                            <th>Status</th>
+                            <th>Product</th>
+                            <th>Validity</th>
+                            <th>Order Time</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for order in orders %}
+                        <tr>
+                            <td>{{ order.oms_order_id }}</td>
+                            <td>{{ order.trading_symbol }}</td>
+                            <td>{{ order.exchange }}</td>
+                            <td>{{ order.transaction_type }}</td>
+                            <td>{{ order.quantity }}</td>
+                            <td>{{ order.price }}</td>
+                            <td>{{ order.trigger_price }}</td>
+                            <td>{{ order.status }}</td>
+                            <td>{{ order.product }}</td>
+                            <td>{{ order.validity }}</td>
+                            <td>{{ order.order_timestamp }}</td>
+                            <td class="action-cell">
+                                {% if order.status in ['pending', 'trigger pending', 'open'] %}
+                                <button onclick="modifyOrder({{ order | tojson | safe }})" style="background-color:#2196F3;color:white;padding:5px 10px;border:none;border-radius:4px;cursor:pointer;">Modify</button>
+                                <a href="{{ url_for('cancel_order', order_id=order.oms_order_id) }}" style="background-color:#f44336;color:white;padding:5px 10px;text-decoration:none;border-radius:4px;" onclick="return confirm('Are you sure you want to cancel this order?');">Cancel</a>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            
+            <div id="positions" class="tab-content {% if active_tab == 'positions' %}active{% endif %}">
+                <h2>Net Positions (Live) 
+                    <span id="status-indicator" class="status-indicator offline"></span>
+                    <span id="status-text">Offline</span>
+                </h2>
+                <p>Positions are updated automatically every 5 seconds. Last update: <span id="last-update">Never</span></p>
+                
+                <button class="squareoff-all" onclick="squareOffAllPositions()">Square Off All Positions</button>
+                
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Exchange</th>
+                            <th>Product</th>
+                            <th>Quantity</th>
+                            <th>Average Price</th>
+                            <th>Last Price</th>
+                            <th>P&L</th>
+                            <th>P&L %</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positions-tbody">
+                        <!-- Initial positions will be rendered here by Flask -->
+                        {% if positions %}
+                            {% for position in positions %}
+                            <tr>
+                                <td>{{ position.trading_symbol }}</td>
+                                <td>{{ position.exchange }}</td>
+                                <td>{{ position.product }}</td>
+                                <td>{{ position.quantity }}</td>
+                                <td>{{ position.average_price }}</td>
+                                <td>{{ position.last_price }}</td>
+                                <td>{{ position.pnl }}</td>
+                                <td>{{ position.pnl_percentage }}</td>
+                                <td class="action-cell">
+                                    <button onclick="squareOffPosition({{ position | tojson | safe }})" style="background-color:#FF9800;color:white;padding:5px 10px;border:none;border-radius:4px;cursor:pointer;">Square Off</button>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                        <tr>
+                            <td colspan="9" style="text-align:center;">No open positions.</td>
+                        </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+                <div id="positions-loading" class="loading-indicator" style="display: none;">Updating...</div>
+            </div>
+            
+            <div id="trades" class="tab-content {% if active_tab == 'trades' %}active{% endif %}">
+                <h2>Trade Book</h2>
+                <button onclick="refreshTrades()">Refresh</button>
+                
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Trade ID</th>
+                            <th>Order ID</th>
+                            <th>Symbol</th>
+                            <th>Exchange</th>
+                            <th>Type</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                            <th>Trade Time</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for trade in trades %}
+                        <tr>
+                            <td>{{ trade.trade_id }}</td>
+                            <td>{{ trade.oms_order_id }}</td>
+                            <td>{{ trade.trading_symbol }}</td>
+                            <td>{{ trade.exchange }}</td>
+                            <td>{{ trade.transaction_type }}</td>
+                            <td>{{ trade.quantity }}</td>
+                            <td>{{ trade.price }}</td>
+                            <td>{{ trade.trade_timestamp }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            
+            <div style="margin-top: 30px;">
+                <form method="post" action="/logout">
+                    <button type="submit" class="logout">Logout</button>
+                </form>
+            </div>
+        {% endif %}
     </div>
-
+    
     <script>
-        let botInterval;
+        let positionsInterval = null;
+        let isUpdating = false;
 
-        function showStatus(message, type = 'info') {
-            const statusDiv = document.getElementById('status');
-            statusDiv.innerHTML = `<div class="status status-${type}">${message}</div>`;
-            setTimeout(() => statusDiv.innerHTML = '', 5000);
-        }
+        function showTab(tabName) {
+            // Hide all tab contents
+            const tabContents = document.querySelectorAll('.tab-content');
+            tabContents.forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Remove active class from all tabs
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show the selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to the clicked tab
+            event.target.classList.add('active');
 
-        function formatNumber(num) {
-            if (num === null || num === undefined || num === '-') return '-';
-            return parseInt(num).toLocaleString();
+            // Stop the live updates if we are leaving the positions tab
+            if (tabName !== 'positions' && positionsInterval) {
+                clearInterval(positionsInterval);
+                positionsInterval = null;
+                updateStatusIndicator('offline');
+            }
+            
+            // Start live updates if we are entering the positions tab
+            if (tabName === 'positions' && !positionsInterval) {
+                // Initial fetch
+                fetchAndUpdatePositions();
+                // Set interval for subsequent fetches (every 5 seconds)
+                positionsInterval = setInterval(fetchAndUpdatePositions, 5000);
+            }
         }
         
-        function formatChange(num) {
-            if (num === null || num === undefined || num === '-') return '-';
-            const value = parseFloat(num);
-            const formatted = value > 0 ? `+${value.toFixed(2)}` : value.toFixed(2);
-            const className = value < 0 ? 'negative' : 'positive';
-            return `<span class="${className}">${formatted}</span>`;
-        }
-
-        async function fetchOptionChain() {
-            try {
-                const response = await fetch('/fetch');
-                const data = await response.json();
-                
-                if (data.error) {
-                    showStatus(data.error, 'error');
-                    return;
-                }
-
-                const atmStrike = data.pop().atm_strike;
-                // Get the offset values from the form inputs
-                const ceOffset = parseInt(document.querySelector('input[name="ce_offset"]').value) || -300;
-                const peOffset = parseInt(document.querySelector('input[name="pe_offset"]').value) || 300;
-                
-                // Calculate the offset strikes
-                const ceOffsetStrike = atmStrike + ceOffset;
-                const peOffsetStrike = atmStrike + peOffset;
-                
-                let html = `<div class="atm-strike">ATM Strike: ${atmStrike}</div>`;
-                html += '<table class="table"><thead>';
-                html += '<tr>';
-                html += '<th rowspan="2">Strike</th>';
-                html += '<th colspan="5" class="section-header">Call Option</th>';
-                html += '<th colspan="5" class="section-header">Put Option</th>';
-                html += '</tr>';
-                html += '<tr>';
-                html += '<th>LTP</th>';
-                html += '<th>Change</th>';
-                html += '<th>OI</th>';
-                html += '<th>OI Chg</th>';
-                html += '<th>Volume</th>';
-                html += '<th>Volume</th>';
-                html += '<th>OI Chg</th>';
-                html += '<th>OI</th>';
-                html += '<th>Change</th>';
-                html += '<th>LTP</th>';
-                html += '</tr>';
-                html += '</thead><tbody>';
-                
-                data.forEach(row => {
-                    // Determine if this row should be highlighted
-                    let rowClass = '';
-                    let rowLabel = '';
-                    
-                    if (row.strike_price === atmStrike) {
-                        rowClass = 'atm-row';
-                        rowLabel = '<span class="row-label">ATM</span>';
-                    } else if (row.strike_price === ceOffsetStrike) {
-                        rowClass = 'ce-offset-row';
-                        rowLabel = '<span class="row-label">CE Offset</span>';
-                    } else if (row.strike_price === peOffsetStrike) {
-                        rowClass = 'pe-offset-row';
-                        rowLabel = '<span class="row-label">PE Offset</span>';
-                    }
-                    
-                    html += `<tr class="${rowClass}">
-                        <td class="strike-column">${rowLabel} ${row.strike_price}</td>
-                        <td class="ltp-column">${row.CE_LTP || '-'}</td>
-                        <td class="change-column">${formatChange(row.CE_Chng)}</td>
-                        <td class="oi-column">${formatNumber(row.CE_OI)}</td>
-                        <td class="change-column">${formatChange(row.CE_OI_Chng)}</td>
-                        <td class="volume-column">${formatNumber(row.CE_VOLUME)}</td>
-                        <td class="volume-column">${formatNumber(row.PE_VOLUME)}</td>
-                        <td class="change-column">${formatChange(row.PE_OI_Chng)}</td>
-                        <td class="oi-column">${formatNumber(row.PE_OI)}</td>
-                        <td class="change-column">${formatChange(row.PE_Chng)}</td>
-                        <td class="ltp-column">${row.PE_LTP || '-'}</td>
-                    </tr>`;
-                });
-                
-                html += '</tbody></table>';
-                document.getElementById('option-chain').innerHTML = html;
-                showStatus('Option chain updated successfully', 'success');
-            } catch (error) {
-                showStatus('Error fetching option chain: ' + error.message, 'error');
+        function togglePriceField() {
+            const orderType = document.getElementById('order_type').value;
+            const priceField = document.getElementById('price_field');
+            const triggerField = document.getElementById('trigger_field');
+            
+            if (orderType === 'MARKET' || orderType === 'SL-M') {
+                priceField.style.display = 'none';
+            } else {
+                priceField.style.display = 'block';
+            }
+            
+            if (orderType === 'SL' || orderType === 'SL-M') {
+                triggerField.style.display = 'block';
+            } else {
+                triggerField.style.display = 'none';
             }
         }
 
-        async function startBot() {
-            try {
-                const response = await fetch('/start_bot', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.error) {
-                    showStatus(data.error, 'error');
+        function modifyOrder(orderDetails) {
+            // Populate the form with the order's details
+            document.getElementById('tradingsymbol').value = orderDetails.trading_symbol;
+            document.getElementById('exchange').value = orderDetails.exchange;
+            document.getElementById('transaction_type').value = orderDetails.transaction_type;
+            document.getElementById('order_type').value = orderDetails.order_type;
+            document.getElementById('quantity').value = orderDetails.quantity;
+            document.getElementById('price').value = orderDetails.price;
+            document.getElementById('trigger_price').value = orderDetails.trigger_price;
+            document.getElementById('product').value = orderDetails.product;
+            document.getElementById('validity').value = orderDetails.validity;
+            document.getElementById('variety').value = orderDetails.variety || 'regular';
+            
+            // Switch to the place order tab
+            showTab('place_order');
+            // Ensure correct fields are shown/hidden
+            togglePriceField();
+        }
+
+        function squareOffPosition(positionDetails) {
+            // Determine the opposite transaction type
+            const transactionType = parseInt(positionDetails.quantity) > 0 ? 'SELL' : 'BUY';
+            const quantity = Math.abs(parseInt(positionDetails.quantity));
+
+            // Populate the form to create an exit order
+            document.getElementById('tradingsymbol').value = positionDetails.trading_symbol;
+            document.getElementById('exchange').value = positionDetails.exchange;
+            document.getElementById('transaction_type').value = transactionType;
+            document.getElementById('quantity').value = quantity;
+            document.getElementById('product').value = positionDetails.product;
+            document.getElementById('order_type').value = 'MARKET'; // Use market order for quick exit
+            document.getElementById('validity').value = 'DAY';
+            document.getElementById('variety').value = 'regular';
+            
+            // Switch to the place order tab
+            showTab('place_order');
+            // Ensure correct fields are shown/hidden
+            togglePriceField();
+        }
+        
+        function squareOffAllPositions() {
+            if (!confirm('Are you sure you want to square off all positions? This action cannot be undone.')) {
+                return;
+            }
+            
+            showNotification('Processing square off for all positions...', 'success');
+            
+            fetch('{{ url_for("squareoff_all") }}', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    showNotification(`Successfully squared off ${data.count} positions.`, 'success');
+                    // Refresh positions after a short delay
+                    setTimeout(() => {
+                        fetchAndUpdatePositions();
+                    }, 1000);
                 } else {
-                    showStatus(data.message, 'success');
-                    startBotStatusCheck();
+                    showNotification(`Error: ${data.message}`, 'error');
                 }
-            } catch (error) {
-                showStatus('Error starting bot: ' + error.message, 'error');
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showNotification('Failed to square off all positions. Please try again.', 'error');
+            });
+        }
+        
+        function updateStatusIndicator(status) {
+            const indicator = document.getElementById('status-indicator');
+            const text = document.getElementById('status-text');
+            
+            indicator.className = 'status-indicator';
+            
+            switch(status) {
+                case 'online':
+                    indicator.classList.add('online');
+                    text.textContent = 'Online';
+                    break;
+                case 'updating':
+                    indicator.classList.add('updating');
+                    text.textContent = 'Updating';
+                    break;
+                case 'offline':
+                default:
+                    indicator.classList.add('offline');
+                    text.textContent = 'Offline';
+                    break;
             }
         }
-
-        async function stopBot() {
+        
+        function updateLastUpdateTime() {
+            const now = new Date();
+            document.getElementById('last-update').textContent = now.toLocaleTimeString();
+        }
+        
+        function showNotification(message, type) {
+            // Remove any existing notifications
+            const existingNotification = document.querySelector('.notification');
+            if (existingNotification) {
+                existingNotification.remove();
+            }
+            
+            // Create new notification
+            const notification = document.createElement('div');
+            notification.className = `notification ${type}`;
+            notification.textContent = message;
+            
+            // Add to DOM
+            document.body.appendChild(notification);
+            
+            // Remove after 5 seconds
+            setTimeout(() => {
+                notification.remove();
+            }, 5000);
+        }
+        
+        function refreshOrderBook() {
+            window.location.href = '{{ url_for("order_book") }}';
+        }
+        
+        function refreshPositions() {
+            window.location.href = '{{ url_for("positions") }}';
+        }
+        
+        function refreshTrades() {
+            window.location.href = '{{ url_for("trades") }}';
+        }
+        
+        // --- Live Positions Logic ---
+        async function fetchAndUpdatePositions() {
+            if (isUpdating) return; // Prevent multiple simultaneous updates
+            
+            const loadingIndicator = document.getElementById('positions-loading');
+            const tbody = document.getElementById('positions-tbody');
+            
+            isUpdating = true;
+            updateStatusIndicator('updating');
+            
             try {
-                const response = await fetch('/stop_bot', { method: 'POST' });
-                const data = await response.json();
+                loadingIndicator.style.display = 'block';
+                console.log('Fetching positions...');
                 
-                if (data.error) {
-                    showStatus(data.error, 'error');
-                } else {
-                    showStatus(data.message, 'success');
-                    clearInterval(botInterval);
-                }
-            } catch (error) {
-                showStatus('Error stopping bot: ' + error.message, 'error');
-            }
-        }
-
-        async function resetBot() {
-            try {
-                const response = await fetch('/reset', { method: 'POST' });
-                const data = await response.json();
+                const response = await fetch('{{ url_for("api_positions") }}');
+                console.log('Response received:', response.status);
                 
-                if (data.error) {
-                    showStatus(data.error, 'error');
-                } else {
-                    showStatus(data.message, 'success');
-                    document.getElementById('signals').innerHTML = '';
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
                 }
-            } catch (error) {
-                showStatus('Error resetting bot: ' + error.message, 'error');
-            }
-        }
+                
+                const positions = await response.json();
+                console.log('Positions data:', positions);
 
-        async function startBotStatusCheck() {
-            botInterval = setInterval(async () => {
-                try {
-                    const response = await fetch('/bot_status');
-                    const data = await response.json();
-                    
-                    let signalsHtml = '';
-                    data.signals.forEach(signal => {
-                        signalsHtml += `<div class="signal-item">${signal}</div>`;
+                // Clear existing rows
+                tbody.innerHTML = '';
+
+                // Handle the specific response structure with day and net properties
+                let positionsArray = [];
+                
+                // Check for day positions
+                if (positions && positions.day && Array.isArray(positions.day)) {
+                    positionsArray = positionsArray.concat(positions.day);
+                }
+                
+                // Check for net positions
+                if (positions && positions.net && Array.isArray(positions.net)) {
+                    positionsArray = positionsArray.concat(positions.net);
+                }
+
+                if (!positionsArray || positionsArray.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;">No open positions.</td></tr>';
+                } else {
+                    // Populate table with new data
+                    positionsArray.forEach(position => {
+                        const row = tbody.insertRow();
+                        row.innerHTML = `
+                            <td>${position.trading_symbol || 'N/A'}</td>
+                            <td>${position.exchange || 'N/A'}</td>
+                            <td>${position.product || 'N/A'}</td>
+                            <td>${position.quantity || 'N/A'}</td>
+                            <td>${position.average_price || 'N/A'}</td>
+                            <td>${position.last_price || 'N/A'}</td>
+                            <td>${position.pnl || 'N/A'}</td>
+                            <td>${position.pnl_percentage || 'N/A'}</td>
+                            <td class="action-cell">
+                                <button onclick="squareOffPosition(${JSON.stringify(position).replace(/"/g, '&quot;')})" style="background-color:#FF9800;color:white;padding:5px 10px;border:none;border-radius:4px;cursor:pointer;">Square Off</button>
+                            </td>
+                        `;
                     });
-                    document.getElementById('signals').innerHTML = signalsHtml;
-                } catch (error) {
-                    console.error('Error checking bot status:', error);
                 }
-            }, 2000);
+                
+                updateStatusIndicator('online');
+                updateLastUpdateTime();
+                
+            } catch (error) {
+                console.error("Error fetching live positions:", error);
+                updateStatusIndicator('offline');
+                tbody.innerHTML = `<tr><td colspan="9" style="text-align:center; color: red;">Failed to load positions: ${error.message}</td></tr>`;
+                showNotification(`Failed to load positions: ${error.message}`, 'error');
+            } finally {
+                loadingIndicator.style.display = 'none';
+                isUpdating = false;
+            }
         }
 
-        // Auto-refresh option chain every 5 seconds
-        setInterval(fetchOptionChain, 5000);
-        
-        // Initial load
-        window.onload = function() {
-            fetchOptionChain();
-        };
+        // Initialize the page
+        document.addEventListener('DOMContentLoaded', function() {
+            togglePriceField();
+        });
     </script>
 </body>
 </html>
 """
 
+# =============================
+# Helper Functions
+# =============================
+
+def get_headers():
+    """Get common headers for API requests"""
+    return {
+        'X-Mirae-Version': '1',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+def get_auth_headers(access_token):
+    """Get headers with authentication token"""
+    headers = get_headers()
+    headers['Authorization'] = f'token {API_KEY}:{access_token}'
+    return headers
+
+def make_api_request(method, endpoint, access_token=None, data=None):
+    """Make an API request with error handling"""
+    url = f"{BASE_URL}/{endpoint}"
+    headers = get_auth_headers(access_token) if access_token else get_headers()
+    
+    try:
+        if method == 'GET':
+            response = requests.get(url, headers=headers)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, data=data)
+        else:
+            return None, "Unsupported HTTP method"
+        
+        response.raise_for_status()
+        return response.json(), None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request failed for {url}: {str(e)}")
+        return None, str(e)
+
+def get_common_data(access_token):
+    """
+    Fetches data common to all logged-in pages, like margins.
+    ACTION NEEDED: You must find the correct endpoint for 'margins' in your API documentation.
+    """
+    # *** CHANGE 'margins' HERE IF THE ENDPOINT IS DIFFERENT IN YOUR DOCS ***
+    margins_data, _ = make_api_request('GET', 'margins', access_token)
+    margins = {
+        'equity': {'used': 'N/A', 'available': 'N/A'},
+        'commodity': {'used': 'N/A', 'available': 'N/A'}
+    }
+    
+    if margins_data and 'data' in margins_data:
+        if 'equity' in margins_data['data']:
+            margins['equity'] = margins_data['data']['equity']
+        if 'commodity' in margins_data['data']:
+            margins['commodity'] = margins_data['data']['commodity']
+    
+    return margins
+
+# =============================
+# Routes
+# =============================
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    access_token = session.get('access_token')
+    error = None
+    active_tab = 'dashboard'
+    
+    # Handle OTP verification
+    if request.method == "POST" and not access_token:
+        totp = request.form.get("totp", "").strip()
+        if not totp:
+            error = "OTP is required!"
+        else:
+            checksum = hashlib.sha256(f"{API_KEY}{totp}{API_SECRET}".encode()).hexdigest()
+            data = {'api_key': API_KEY, 'totp': totp, 'checksum': checksum}
+            
+            response_data, error = make_api_request('POST', 'session/verifytotp', data=data)
+            
+            if not error and response_data.get("status") == "success":
+                access_token = response_data["data"]["access_token"]
+                session['access_token'] = access_token
+                session['login_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            elif not error:
+                error = response_data.get("message", "Failed to generate session")
+    
+    # If logged in, get dashboard data
+    if access_token:
+        margins = get_common_data(access_token)
+        
+        return render_template_string(
+            HTML_TEMPLATE,
+            access_token=access_token,
+            login_time=session.get('login_time'),
+            error=error,
+            active_tab=active_tab,
+            margins=margins
+        )
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        access_token=None,
+        error=error
+    )
+
+@app.route("/place_order", methods=["POST"])
+def place_order():
+    access_token = session.get("access_token")
+    if not access_token:
+        flash("Please verify OTP first!", "error")
+        return redirect(url_for('index'))
+    
+    # Gather form inputs
+    form_data = {key: request.form[key] for key in request.form}
+    variety = form_data.pop("variety", "regular")
+    
+    # Prepare data for API
+    api_data = {
+        'tradingsymbol': form_data.get('tradingsymbol'),
+        'exchange': form_data.get('exchange'),
+        'transaction_type': form_data.get('transaction_type'),
+        'order_type': form_data.get('order_type'),
+        'quantity': form_data.get('quantity'),
+        'product': form_data.get('product'),
+        'validity': form_data.get('validity'),
+        'price': form_data.get('price', '0'),
+        'trigger_price': form_data.get('trigger_price', '0')
+    }
+    
+    response_data, error = make_api_request('POST', f'orders/{variety}', access_token, api_data)
+    
+    order_response = response_data if not error else {"error": error}
+    
+    margins = get_common_data(access_token)
+
+    return render_template_string(
+        HTML_TEMPLATE,
+        access_token=access_token,
+        login_time=session.get('login_time'),
+        active_tab='place_order',
+        order_response=order_response,
+        margins=margins
+    )
+
+@app.route("/order_book")
+def order_book():
+    access_token = session.get("access_token")
+    if not access_token:
+        flash("Please verify OTP first!", "error")
+        return redirect(url_for('index'))
+    
+    margins = get_common_data(access_token)
+    # *** CHANGE 'orders' HERE IF THE ENDPOINT IS DIFFERENT IN YOUR DOCS ***
+    response_data, error = make_api_request('GET', 'orders', access_token)
+    orders = response_data.get('data', []) if not error else []
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        access_token=access_token,
+        login_time=session.get('login_time'),
+        active_tab='order_book',
+        orders=orders,
+        margins=margins
+    )
+
+@app.route("/cancel_order/<order_id>")
+def cancel_order(order_id):
+    access_token = session.get("access_token")
+    if not access_token:
+        flash("Please verify OTP first!", "error")
+        return redirect(url_for('index'))
+
+    response_data, error = make_api_request('POST', f'orders/regular/{order_id}', access_token)
+
+    if error:
+        flash(f"API request failed: {error}", "error")
+    elif response_data and response_data.get("status") == "success":
+        flash(f"Order {order_id} cancelled successfully.", "success")
+    else:
+        message = response_data.get("message", "Unknown error") if response_data else "Unknown error"
+        flash(f"Failed to cancel order: {message}", "error")
+
+    return redirect(url_for('order_book'))
+
+@app.route("/positions")
+def positions():
+    access_token = session.get("access_token")
+    if not access_token:
+        flash("Please verify OTP first!", "error")
+        return redirect(url_for('index'))
+    
+    margins = get_common_data(access_token)
+    # *** CHANGE 'positions' HERE IF THE ENDPOINT IS DIFFERENT IN YOUR DOCS ***
+    # Try using the full path you mentioned
+    response_data, error = make_api_request('GET', 'portfolio/positions', access_token)
+    
+    # Handle the specific response structure with day and net properties
+    positions = []
+    if not error and response_data:
+        # Check for day positions
+        if 'day' in response_data and response_data['day']:
+            if isinstance(response_data['day'], list):
+                positions.extend(response_data['day'])
+        
+        # Check for net positions
+        if 'net' in response_data and response_data['net']:
+            if isinstance(response_data['net'], list):
+                positions.extend(response_data['net'])
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        access_token=access_token,
+        login_time=session.get('login_time'),
+        active_tab='positions',
+        positions=positions,
+        margins=margins
+    )
+
+@app.route("/api/positions")
+def api_positions():
+    """API endpoint to return positions as JSON for live updates."""
+    access_token = session.get("access_token")
+    if not access_token:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    # *** CHANGE 'positions' HERE IF THE ENDPOINT IS DIFFERENT IN YOUR DOCS ***
+    # Try using the full path you mentioned
+    response_data, error = make_api_request('GET', 'portfolio/positions', access_token)
+    if error:
+        return jsonify({"error": error}), 500
+    
+    # Return the full response structure to let frontend handle day and net positions
+    return jsonify(response_data or {})
+
+@app.route("/squareoff_all", methods=["POST"])
+def squareoff_all():
+    """Square off all open positions."""
+    access_token = session.get("access_token")
+    if not access_token:
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+    
+    # Get all positions
+    response_data, error = make_api_request('GET', 'portfolio/positions', access_token)
+    if error:
+        return jsonify({"success": False, "message": f"Failed to fetch positions: {error}"})
+    
+    # Handle the specific response structure with day and net properties
+    positions = []
+    if response_data:
+        # Check for day positions
+        if 'day' in response_data and response_data['day']:
+            if isinstance(response_data['day'], list):
+                positions.extend(response_data['day'])
+        
+        # Check for net positions
+        if 'net' in response_data and response_data['net']:
+            if isinstance(response_data['net'], list):
+                positions.extend(response_data['net'])
+    
+    if not positions:
+        return jsonify({"success": True, "count": 0, "message": "No positions to square off"})
+    
+    success_count = 0
+    failed_positions = []
+    
+    for position in positions:
+        try:
+            # Determine the opposite transaction type
+            quantity = int(position.get('quantity', 0))
+            if quantity == 0:
+                continue  # Skip positions with zero quantity
+                
+            transaction_type = 'SELL' if quantity > 0 else 'BUY'
+            abs_quantity = abs(quantity)
+            
+            # Prepare order data
+            order_data = {
+                'tradingsymbol': position.get('trading_symbol'),
+                'exchange': position.get('exchange'),
+                'transaction_type': transaction_type,
+                'order_type': 'MARKET',  # Use market order for quick exit
+                'quantity': str(abs_quantity),
+                'product': position.get('product'),
+                'validity': 'DAY',
+                'price': '0',
+                'trigger_price': '0'
+            }
+            
+            # Place the order
+            order_response, order_error = make_api_request('POST', 'orders/regular', access_token, order_data)
+            
+            if order_error:
+                failed_positions.append({
+                    'symbol': position.get('trading_symbol'),
+                    'error': order_error
+                })
+            else:
+                success_count += 1
+                
+        except Exception as e:
+            logger.error(f"Error squaring off position {position.get('trading_symbol')}: {str(e)}")
+            failed_positions.append({
+                'symbol': position.get('trading_symbol'),
+                'error': str(e)
+            })
+    
+    if failed_positions:
+        return jsonify({
+            "success": False,
+            "count": success_count,
+            "message": f"Successfully squared off {success_count} positions. Failed for {len(failed_positions)} positions.",
+            "failed_positions": failed_positions
+        })
+    else:
+        return jsonify({
+            "success": True,
+            "count": success_count,
+            "message": f"Successfully squared off all {success_count} positions."
+        })
+
+@app.route("/trades")
+def trades():
+    access_token = session.get("access_token")
+    if not access_token:
+        flash("Please verify OTP first!", "error")
+        return redirect(url_for('index'))
+    
+    margins = get_common_data(access_token)
+    # *** CHANGE 'trades' HERE IF THE ENDPOINT IS DIFFERENT IN YOUR DOCS ***
+    response_data, error = make_api_request('GET', 'trades', access_token)
+    trades = response_data.get('data', []) if not error else []
+    
+    return render_template_string(
+        HTML_TEMPLATE,
+        access_token=access_token,
+        login_time=session.get('login_time'),
+        active_tab='trades',
+        trades=trades,
+        margins=margins
+    )
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return render_template_string(
+        HTML_TEMPLATE,
+        access_token=None,
+        error=None
+    )
+
+# =============================
+# Run Application
+# =============================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print("\n" + "="*60)
-    print("🚀 Sajid Shaikh Algo Trading Bot - Nifty50 + Dual Broker")
-    print("="*60)
-    print(f"📍 Server: http://127.0.0.1:{port}")
-    print("📝 Users stored in: users.txt")
-    print("🔑 Credentials stored in: user_credentials.txt")
-    print("="*60)
-    print("\nmStock API Routes:")
-    print("  POST /mstock/login - Authenticate with OTP")
-    print("  POST /mstock/refresh_token - Refresh access token")
-    print("  POST /mstock/logout - Logout from mStock")
-    print("  GET  /mstock/status - Check authentication status")
-    print("  GET  /mstock_auth - mStock authentication UI")
-    print("  GET  /mstock_option_chain - mStock option chain view")
-    print("\nFyers API Routes:")
-    print("  GET  /fyers_auth - Fyers authentication UI")
-    print("  GET  /fyers_login - Direct Fyers login")
-    print("\nDual Broker Routes:")
-    print("  POST /place_dual_order - Place order with both brokers")
-    print("="*60 + "\n")
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(debug=True)
